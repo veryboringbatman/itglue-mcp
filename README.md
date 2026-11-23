@@ -1,0 +1,367 @@
+# IT Glue MCP Server
+
+A Model Context Protocol (MCP) server that provides Claude with access to IT Glue documentation and asset management.
+
+## One-Click Deployment
+
+[![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/WYRE-AI/itglue-mcp/tree/main)
+
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/WYRE-AI/itglue-mcp)
+
+> [!NOTE]
+> Unlike the other Wyre MCP servers, this one talks to the IT Glue API directly and
+> has **no private `@wyre-ai/*` runtime dependency**, so the one-click build
+> does not need a GitHub Packages token — the cloud builder's `npm ci` only pulls
+> public packages. (A `read:packages` token is only needed to install the published
+> `@wyre-ai/itglue-mcp` package itself; see [Installation](#installation).)
+> The DigitalOcean target builds the full Docker image and runs the complete MCP
+> server over HTTP and is the recommended path; this repo does not ship a Workers
+> entrypoint (`src/worker.ts`), so prefer DigitalOcean or the prebuilt container
+> image (`ghcr.io/wyre-ai/itglue-mcp`).
+
+## Installation
+
+This package is published to the **GitHub Packages** npm registry, which requires a
+token even for public packages. Authenticate npm once, then install:
+
+```bash
+# Authenticate npm to GitHub Packages (token needs the read:packages scope)
+export NODE_AUTH_TOKEN=$(gh auth token)   # or a PAT with read:packages
+
+npm install @wyre-ai/itglue-mcp
+```
+
+The repo's `.npmrc` already points the `@wyre-ai` scope at GitHub Packages and
+reads the token from `NODE_AUTH_TOKEN`, so no further config is needed. The same applies
+to `npx @wyre-ai/itglue-mcp`.
+
+Or use the Docker image:
+
+```bash
+docker pull ghcr.io/wyre-ai/itglue-mcp:latest
+```
+
+## Configuration
+
+Copy [`.env.example`](.env.example) and set the variables below. Leave `CONDUIT_S2S_SECRET` empty in that file; never commit a real value.
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `ITGLUE_API_KEY` | Your IT Glue API key (format: ITG.xxx). Used by stdio and by HTTP when `AUTH_MODE=env`. | Yes (stdio and env mode) |
+| `ITGLUE_JWT` | A user-session JWT used as an optional **fallback** for document-folder operations on tenants whose API key cannot access the Document Folders resource yet. See [JWT fallback for document-folder operations](#jwt-fallback-for-document-folder-operations). | No |
+| `ITGLUE_REGION` | API region: `us`, `eu`, or `au` (default: `us`) | No |
+| `ITGLUE_BASE_URL` | Override the IT Glue API base URL (advanced) | No |
+| `MCP_TRANSPORT` | Transport: `stdio` (local) or `http` (remote). Defaults to `stdio` when run via `npx`/`node`, and to `http` in the Docker image. | No |
+| `MCP_HTTP_PORT` | Port for HTTP transport (default: `8080`) | No |
+| `MCP_HTTP_HOST` | Bind address when a real `CONDUIT_S2S_SECRET` is set. Unset keeps `0.0.0.0`, the historical container bind. The image and Compose set `0.0.0.0` inside the container. | No |
+| `AUTH_MODE` | `env` (read credentials from environment; image default) or `gateway` (read per-request credentials from HTTP headers; Compose default). Gateway mode never falls back to `ITGLUE_*`. | No |
+| `CONDUIT_S2S_SECRET` | Service-to-service secret for HTTP. The process logs an error and exits non-zero when this is empty or a known placeholder (`changeme`, `secret`, `replace-me`, `your-s2s-secret`, and the other example values). Generate one with `openssl rand -hex 32`. Compose will not start without it. The value is never logged. | Yes for HTTP |
+| `MCP_ALLOW_INSECURE_DEV` | Set to exactly `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning, does not enforce `X-Gateway-S2S`, and binds `127.0.0.1` only. A non-loopback `MCP_HTTP_HOST` refuses to start. A known placeholder secret still refuses to start. | No |
+
+`/health` and `/healthz` stay unauthenticated and do not read credentials. The stdio transport does not use `CONDUIT_S2S_SECRET`.
+
+When `AUTH_MODE=gateway`, the MCP Gateway injects credentials per request via HTTP headers instead of environment variables. See [HTTP authentication](#http-authentication) and [Remote Deployment](#remote-deployment-http-streamable).
+
+### HTTP authentication
+
+With `MCP_TRANSPORT=http` and `CONDUIT_S2S_SECRET` set, every `/mcp` request must include `X-Gateway-S2S`. The check is `verifyS2sHeader` in [`src/s2s-verify.ts`](src/s2s-verify.ts): the header value is `t=<unix seconds>,v1=<hex>`, where the hex is HMAC-SHA256 of the literal string `t=<unix seconds>` keyed with `CONDUIT_S2S_SECRET` (64 lowercase hex characters). The timestamp must be within 300 seconds of the server clock. A missing or invalid header is HTTP 401, before vendor credentials are read.
+
+```bash
+TS=$(date +%s)
+SIG=$(printf 't=%s' "$TS" | openssl dgst -sha256 -hmac "$CONDUIT_S2S_SECRET" -hex | awk '{print $NF}')
+curl -sS http://127.0.0.1:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "X-Gateway-S2S: t=${TS},v1=${SIG}" \
+  -H "X-ITGlue-API-Key: $ITGLUE_API_KEY" \
+  -H "X-ITGlue-Region: us" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+In `AUTH_MODE=gateway`, `/mcp` also requires `X-ITGlue-API-Key` (or `X-API-Key`) or `X-ITGlue-JWT`. Those headers are the only credential source for that request. `AUTH_MODE=env` still requires the signed `X-Gateway-S2S` header, then uses `ITGLUE_API_KEY` and `ITGLUE_JWT` from the environment.
+
+### JWT fallback for document-folder operations
+
+**A JWT is optional** — it is only needed if your tenant's API key can't access Document Folders yet. Every folder-related path tries your API key first:
+
+- `search_documents` — defaults to a folder-inclusive listing (`filter[document_folder_id]=null` returns all documents, foldered ones included; each result carries its `documentFolderId`). If the tenant's API rejects that filter, the server retries the `[ne]` filter form and finally degrades to the legacy root-only listing, saying so in the result. No JWT is involved at any layer.
+- `list_document_folders` — IT Glue's public (API-key) API now documents a Document Folders resource, which is rolling out across tenants through 2026. The server tries the API key first (on the organization-relationship path, then the top-level `/document_folders` path) and only falls back to a JWT if the key is rejected.
+- `create_document` — the name-based folder picker uses the same API-key-first enumeration, then a configured JWT; if neither can list folders, it prompts for a folder URL / sibling-document URL / numeric folder ID as the last resort.
+
+If you do need the JWT fallback, provide it in whichever way matches your deployment:
+
+| Mode | How to supply the JWT |
+|------|-----------------------|
+| Local / env (`AUTH_MODE=env`) | Set the `ITGLUE_JWT` environment variable. |
+| Remote gateway (`AUTH_MODE=gateway`) | Send the `X-ITGlue-JWT` request header. |
+| Interactive clients (Claude Desktop/Code) | Leave it unset — the server prompts you to paste a JWT on first use and caches it for the session. |
+
+> **Headless deployments (Docker, cloud):** there is no one to answer the interactive prompt, so if your tenant's API key cannot enumerate folders you must set `ITGLUE_JWT` (env mode) or send `X-ITGlue-JWT` (gateway mode) for folder enumeration to work.
+
+**Retrieving a JWT from your browser:**
+
+1. Sign in to IT Glue in your browser.
+2. Open DevTools → **Network** tab.
+3. Click any request to `itg-api-*.itglue.com`.
+4. Copy the value of the `Authorization: Bearer <token>` request header — the `<token>` part is your JWT.
+
+> **Expiry:** IT Glue JWTs are short-lived (~2 hours). A JWT placed in `ITGLUE_JWT` on a long-running container will go stale and the JWT fallback will start failing until it is refreshed. Interactive clients are simply re-prompted on expiry. API-key operations are unaffected.
+
+## Available Tools
+
+### Organizations
+
+- **search_organizations** - Search for organizations with optional filtering by name, type, status, or PSA ID
+- **get_organization** - Get a specific organization by ID
+
+### Configurations (Devices/Assets)
+
+- **search_configurations** - Search for configurations with filtering by organization, name, type, status, serial number, RMM ID, or PSA ID
+- **get_configuration** - Get a specific configuration by ID
+- **archive_configuration** - Archive a configuration (soft delete — hides it from normal views but keeps it recoverable). Reversible with `unarchive_configuration`. Configurations synced from a PSA/RMM integration (`psaIntegration: enabled` / `syncActive: true`) may be restored or updated by the next sync, so tidy up the source system (Autotask / Datto RMM) first
+- **unarchive_configuration** - Restore a previously archived configuration so it appears in normal views again
+
+### Locations (Addresses/Sites)
+
+- **search_locations** - Search an organization's locations (built-in address/site records), filtering by organization, name, city, region, or country. Results include the address fields and phone number.
+- **get_location** - Get a specific location by ID, including its full address and phone number
+- **create_location** - Create a new location for an organization (requires `name`, typically `country_id`)
+- **update_location** - Update an existing location; only the fields you supply are changed
+
+### Passwords
+
+- **search_passwords** - Search for password entries (metadata only, no actual passwords in results)
+- **get_password** - Get a specific password entry including the actual password value
+
+### Documents
+
+- **search_documents** - Search for documents with filtering by organization, name, or folder. Defaults to a folder-inclusive listing (each result carries its `documentFolderId`), degrading gracefully to a root-only listing on tenants whose API rejects the folder filter
+- **get_document** - Get a specific document by ID, including its sectioned body. Renders as an interactive card in MCP Apps hosts — see [Interactive Document Card](#interactive-document-card-mcp-apps)
+- **list_document_folders** - List an organization's document folders (names and IDs). Works with an API key on tenants where IT Glue exposes the Document Folders resource; falls back to a JWT otherwise — see [JWT fallback for document-folder operations](#jwt-fallback-for-document-folder-operations)
+- **create_document** - Create a document in an organization, optionally with body content. Prompts for a folder if none is given; pass `skip_folder_prompt=true` to create at the organization root
+- **update_document** - Rename a document. Only the name you supply is changed. Folder moves are not supported: IT Glue's Documents API marks `document_folder_id` as not permitted on PUT/PATCH
+- **list_document_sections** - List a document's sections in order, before editing
+- **create_document_section** - Add a heading or text section. Call `publish_document` after editing
+- **update_document_section** - Replace a section's content. Call `publish_document` after editing
+- **delete_document_section** - ⚠ Permanently delete one section (irreversible). Call `publish_document` after editing
+- **publish_document** - Publish section changes so they become visible
+- **archive_document** - Soft-delete a document (hidden from normal views, recoverable with `unarchive_document`)
+- **unarchive_document** - Restore a previously archived document
+- **delete_document** - ⚠ Permanently delete a document and all its sections (irreversible — prefer `archive_document` if it may be needed again)
+
+### Attachments
+
+- **create_attachment** - Attach a file to a checklist, checklist template, configuration, contact, document, domain, flexible asset, location, password, SSL certificate or ticket. Base64 in. Also the only supported route to a picture in a document body — see [Images in documents](#images-in-documents)
+- **list_attachments** - List a record's attachments, with their download URLs
+
+### Flexible Assets
+
+- **search_flexible_assets** - Search for flexible assets (requires flexible_asset_type_id)
+
+### User Metrics
+
+- **search_user_metrics** - Search user activity metrics: per-user, per-organization, per-resource-type counts of `created` / `viewed` / `edited` / `deleted` actions, bucketed by date. Filter by `user_id`, `organization_id`, `resource_type`, and a `start_date` / `end_date` range; sort by `id`, `created`, `viewed`, `edited`, `deleted`, or `date` (prefix `-` for descending).
+
+  This is the raw data behind IT Glue's user reputation scores, so it answers "who is actually maintaining documentation" — per tech, per client, per resource type.
+
+  **Date-range rules** (verified live against `api.itglue.com`, 2026-08-06):
+
+  - The range may span at most **7 days end-to-start** — so `2026-08-01,2026-08-08` is accepted (8 calendar days) and `2026-08-01,2026-08-09` returns 422. The API compares the *difference*, not the inclusive day count; reading "longer than a week" as 7 inclusive days is off by one in the direction that rejects valid queries.
+  - **`end_date` requires `start_date`.** IT Glue rejects a filter beginning with a wildcard (`*,2026-08-07` → 422), so an end alone is a guaranteed error rather than a narrower query. An open *end* (`2026-08-01,*`) is fine.
+  - Both violations return the **same** 422 title — *"date range filter cannot be longer than a week, and cannot start with a wildcard"* — so the API cannot tell you which one you hit. The tool checks both itself and says which, without spending the call.
+  - Omit both dates to let IT Glue apply its own default window.
+
+  **Gotcha — unknown filter keys are silently ignored.** `filter[not-a-real-key]=x` returns HTTP 200 with the *full unfiltered* result set, not an error (verified live). A typo'd or misremembered filter name therefore looks like a successful, correctly-scoped query while actually returning everything. Cross-check row counts against a deliberately impossible value (`filter[resource-type]=ZZZNoSuchType` correctly returns 0 rows) if a result looks too broad.
+
+### Utility
+
+- **itglue_health_check** - Verify connectivity to IT Glue API
+
+### Interactive Document Card (MCP Apps)
+
+`get_document` renders as an interactive card in MCP Apps hosts (Claude
+Desktop/web) showing the document's name, organization, folder, key dates, and a
+plain-text preview of its sections; plain-JSON behavior is unchanged in other
+hosts. The card is read-only — neutral by default, brandable via
+`window.__BRAND__` injection or `MCP_BRAND_*` env vars (`MCP_BRAND_NAME`,
+`MCP_BRAND_LOGO_URL`, `MCP_BRAND_PRIMARY_COLOR`, `MCP_BRAND_ACCENT_COLOR`,
+`MCP_BRAND_BG`, `MCP_BRAND_TEXT`) — no rebuild needed.
+
+### Images in documents
+
+Getting a picture into a document body is attachment-shaped, not image-shaped.
+Verified live against `api.itglue.com`, 2026-08-31:
+
+| What you try | What happens |
+|---|---|
+| Inline `<svg>` in section HTML | **Silently stripped.** The section saves, returns 200, and the diagram is simply gone from the stored content |
+| `<img src="data:image/png;base64,…">` | **Rejected with a 500**, not a validation error |
+| `POST /documents/{id}/relationships/document_images` | **404** |
+| Upload an attachment, then `<img src="https://…/attachments/{id}">` | Works, and renders inline |
+
+A caveat on that 404, because it is easy to over-read. Document images are a
+real resource — the IT Glue web editor creates them, storing a *relative* path
+like `/{org_id}/docs/{doc_id}/images/{image_id}` in the section HTML which the
+renderer swaps for a signed S3 URL on read. What could not be found is a route
+on the **documented public API** to create one; the editor appears to use an
+internal endpoint. So the right reading is "no public-API image upload route
+found", not "document images do not exist".
+
+Hence `create_attachment`: upload the file, then reference the `downloadUrl` it
+returns. The inline-SVG case is the one worth knowing about, because it looks
+like a successful write.
+
+```
+create_attachment(resource_type="documents", resource_id, file_name, content)
+→ reference the returned downloadUrl from an <img src> in update_document_section
+→ publish_document
+```
+
+Note the sanitiser also drops some inline style properties (`max-width` among
+them), so size the image to the width you want rather than relying on CSS.
+
+Pass **raw base64**. If a `data:...;base64,` prefix is left on the front the
+tool strips it rather than passing it through: IT Glue stores whatever it is
+given, so a prefixed payload uploads "successfully" and produces a corrupt file
+that only surfaces when somebody opens it.
+
+## Usage with Claude Code
+
+Add to your `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "itglue": {
+      "command": "npx",
+      "args": ["@wyre-ai/itglue-mcp"],
+      "env": {
+        "ITGLUE_API_KEY": "${ITGLUE_API_KEY}",
+        "ITGLUE_REGION": "us"
+      }
+    }
+  }
+}
+```
+
+Or with Docker (local stdio):
+
+```json
+{
+  "mcpServers": {
+    "itglue": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "MCP_TRANSPORT=stdio",
+        "-e", "ITGLUE_API_KEY",
+        "ghcr.io/wyre-ai/itglue-mcp:latest"
+      ],
+      "env": {
+        "ITGLUE_API_KEY": "${ITGLUE_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+> **Note:** The Docker image defaults to HTTP transport. The `-e MCP_TRANSPORT=stdio` above is required to run it as a local stdio server for Claude Desktop/Code. For server deployments, see [Remote Deployment](#remote-deployment-http-streamable) below.
+
+## Remote Deployment (HTTP Streamable)
+
+For server/cloud deployments, run the server with the HTTP Streamable transport. The Docker image already defaults to `MCP_TRANSPORT=http` on port `8080` and listens on `0.0.0.0` inside the container. Startup refuses to run until `CONDUIT_S2S_SECRET` is a real secret. Publish the port on loopback unless a proxy sits in front. Two endpoints:
+
+- `POST /mcp` — MCP Streamable HTTP endpoint (stateless: a fresh server is created per request). Requires a valid `X-Gateway-S2S` header. See [HTTP authentication](#http-authentication).
+- `GET /health` and `GET /healthz` — unauthenticated health checks that do not read credentials
+
+### Env mode (single tenant)
+
+Credentials come from environment variables after S2S auth succeeds. Use this when one API key serves the deployment. The image defaults to `AUTH_MODE=env`.
+
+```bash
+docker run -d \
+  --name itglue-mcp \
+  -p 127.0.0.1:8080:8080 \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e ITGLUE_API_KEY="ITG.xxxxxxxx" \
+  -e ITGLUE_REGION="us" \
+  --restart unless-stopped \
+  ghcr.io/wyre-ai/itglue-mcp:latest
+
+# Verify
+curl http://127.0.0.1:8080/health
+# {"status":"ok","transport":"http","authMode":"env",...}
+```
+
+Clients connect to `http://127.0.0.1:8080/mcp` using the MCP Streamable HTTP transport and must send `X-Gateway-S2S`.
+
+### Gateway mode (multi-tenant / hosted)
+
+When deployed behind an MCP Gateway (e.g. `mcp.wyre.ai`), set `AUTH_MODE=gateway`. Credentials are then injected per request via HTTP headers rather than environment variables. A request missing both credential headers gets `401` and does not fall back to `ITGLUE_API_KEY` or `ITGLUE_JWT` in the process environment. Compose is this mode: it does not set those variables and does not use `env_file`, so a project `.env` cannot inject static vendor credentials. Compose still requires `CONDUIT_S2S_SECRET`.
+
+```bash
+docker run -d \
+  --name itglue-mcp \
+  -p 127.0.0.1:8080:8080 \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e AUTH_MODE=gateway \
+  --restart unless-stopped \
+  ghcr.io/wyre-ai/itglue-mcp:latest
+```
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" docker compose up
+```
+
+The gateway supplies credentials and the `X-Gateway-S2S` proof on each request:
+
+| Header | Description | Required |
+|--------|-------------|----------|
+| `X-Gateway-S2S` | `t=<unix seconds>,v1=<hex hmac-sha256>` signed with `CONDUIT_S2S_SECRET`. See [HTTP authentication](#http-authentication). | Yes |
+| `X-ITGlue-API-Key` (or `X-API-Key`) | IT Glue API key | One of API-Key or JWT |
+| `X-ITGlue-JWT` | JWT for elevated-scope operations | One of API-Key or JWT |
+| `X-ITGlue-Region` | API region: `us`, `eu`, or `au` (default: `us`) | No |
+| `X-ITGlue-Base-URL` | Override the IT Glue API base URL | No |
+
+Requests missing both `X-ITGlue-API-Key` and `X-ITGlue-JWT` receive a `401`. The `/health` endpoint reports `"authMode":"gateway"` in this mode and does not read those headers.
+
+### Running without Docker
+
+The same transport works from an installed/built copy by setting `MCP_TRANSPORT=http`. It refuses to start until `CONDUIT_S2S_SECRET` is set:
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  MCP_TRANSPORT=http MCP_HTTP_PORT=8080 ITGLUE_API_KEY="ITG.xxxxxxxx" \
+  npx @wyre-ai/itglue-mcp
+```
+
+Local HTTP without a secret is development-only. It binds `127.0.0.1` and logs a warning. A non-loopback `MCP_HTTP_HOST` (including `0.0.0.0`) makes startup exit:
+
+```bash
+MCP_TRANSPORT=http MCP_HTTP_HOST=127.0.0.1 MCP_ALLOW_INSECURE_DEV=1 \
+  npx @wyre-ai/itglue-mcp
+```
+
+## Example Queries
+
+Once configured, you can ask Claude:
+
+- "Search for organizations containing 'Acme' in IT Glue"
+- "Get the configuration details for device ID 12345"
+- "Find all passwords for organization ID 100"
+- "Search for flexible assets of type 54321"
+
+## Security Notes
+
+- Password search results do not include actual password values for security
+- Use `get_password` with explicit ID to retrieve password values
+- Store your API key securely using environment variables or a secrets manager
+- The API key should have appropriate read permissions in IT Glue
+
+## License
+
+Apache-2.0
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
